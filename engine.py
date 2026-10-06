@@ -16,7 +16,9 @@ def conn():
     os.makedirs(os.path.dirname(DB) or '.',exist_ok=True); c=sqlite3.connect(DB,timeout=30); c.execute('PRAGMA journal_mode=WAL')
     c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS alerts (symbol TEXT, strategy TEXT, day TEXT, price REAL, stop REAL, target REAL, PRIMARY KEY(symbol,strategy,day))')
-    c.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy TEXT, entry_day TEXT, entry REAL, qty REAL, stop REAL, target REAL, exit_day TEXT, exit REAL, status TEXT)')
+    c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, strategy TEXT, entry_day TEXT, entry REAL, qty REAL, stop REAL, target REAL, exit_day TEXT, exit REAL, status TEXT, direction TEXT DEFAULT 'LONG')")
+    try:c.execute("ALTER TABLE trades ADD COLUMN direction TEXT DEFAULT 'LONG'")
+    except sqlite3.OperationalError:pass
     c.execute('CREATE TABLE IF NOT EXISTS strategies (name TEXT PRIMARY KEY, description TEXT, config TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, protected INTEGER NOT NULL DEFAULT 0, created_at TEXT, updated_at TEXT)')
     for name,cfg in TEMPLATES.items():
         c.execute('INSERT OR IGNORE INTO strategies(name,description,config,enabled,protected,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(name,cfg['description'],json.dumps(cfg),1,1,dt.datetime.utcnow().isoformat(),dt.datetime.utcnow().isoformat()))
@@ -62,8 +64,10 @@ def validate_config(cfg):
     for r in rules:
         if r.get('field') not in FIELDS or r.get('op') not in OPS:raise ValueError('Invalid rule field/operator')
         if not any(k in r for k in ('value','param','compare')):raise ValueError('Each rule needs value, param or compare')
-def fetch(symbol,period='10y'):
-    d=yf.download(symbol,period=period,interval='1d',auto_adjust=True,progress=False,threads=False,multi_level_index=False)
+def fetch(symbol,period='10y',interval='1d'):
+    # Yahoo limits intraday history; use a compatible period automatically.
+    if interval=='1h' and period in ('5y','10y','max'): period='2y'
+    d=yf.download(symbol,period=period,interval=interval,auto_adjust=True,progress=False,threads=False,multi_level_index=False)
     if d is None or d.empty:raise ValueError(f'No price history for {symbol}')
     if isinstance(d.columns,pd.MultiIndex):d.columns=d.columns.get_level_values(0)
     d=d[['Open','High','Low','Close','Volume']].dropna(subset=['Open','High','Low','Close']).copy(); d.index=pd.to_datetime(d.index).tz_localize(None) if d.index.tz is not None else pd.to_datetime(d.index); return d
@@ -151,3 +155,65 @@ def paper_open(symbol,strategy,entry,stop,target,account=10000,risk=.5):
 def paper_close(id,price):
     if price<=0:raise ValueError('Exit price must be positive')
     with conn() as c:c.execute("UPDATE trades SET exit_day=?,exit=?,status='CLOSED' WHERE id=? AND status='OPEN'",(dt.date.today().isoformat(),price,id))
+
+
+def currency_info():
+    code=get_setting('currency','GBP'); symbols={'GBP':'£','USD':'$','EUR':'€'}
+    return code,symbols.get(code,code+' ')
+
+def live_quotes(tickers):
+    out={}
+    for sym in sorted(set(tickers)):
+        try:
+            d=fetch(sym,'5d','1d'); out[sym]={'price':float(d.Close.iloc[-1]),'asof':str(d.index[-1])}
+        except Exception as e:out[sym]={'error':str(e)}
+    return out
+
+def paper_open_v3(symbol,strategy,entry,stop,target,direction='LONG',account=10000,risk=.5):
+    direction=direction.upper()
+    if direction=='LONG' and not (0<stop<entry<target):raise ValueError('For a Buy/Long trade: Stop < Entry < Target')
+    if direction=='SHORT' and not (0<target<entry<stop):raise ValueError('For a Sell/Short trade: Target < Entry < Stop')
+    risk_per_unit=abs(entry-stop)
+    with conn() as c:
+        closed=c.execute("SELECT COALESCE(SUM(CASE WHEN direction='SHORT' THEN qty*(entry-exit) ELSE qty*(exit-entry) END),0) FROM trades WHERE status='CLOSED'").fetchone()[0]; equity=account+closed
+        qty=max(0,equity)*risk/100/risk_per_unit
+        if qty<=0:raise ValueError('Insufficient paper buying power')
+        c.execute('INSERT INTO trades(symbol,strategy,entry_day,entry,qty,stop,target,status,direction) VALUES(?,?,?,?,?,?,?,?,?)',(symbol,strategy,dt.date.today().isoformat(),entry,qty,stop,target,'OPEN',direction))
+    return qty
+
+def backtest_v3(d,strategy,initial=10000,risk_pct=.5,commission=1.5,slippage_pct=.05,max_hold=None):
+    s=get_strategy(strategy) if isinstance(strategy,str) else {'name':'Ad hoc','config':strategy}; cfg=s['config']; direction=cfg.get('direction','LONG').upper(); d=indicators(d,cfg); d['high_swing']=d.High.shift(1).rolling(int(cfg['params'].get('swing_lookback',5))).max(); signals=evaluate_rules(d,cfg); cash=float(initial); equity=[]; trades=[]; pos=None; p=cfg['params']; hold=int(max_hold or p.get('max_hold',20)); warmup=max(60,int(p.get('ma_slow',50))+5); slip=slippage_pct/100
+    for i in range(warmup,len(d)):
+        day=str(d.index[i].date()); row=d.iloc[i]
+        if pos:
+            out=None; reason=''
+            if direction=='LONG':
+                if row.Low<=pos['stop']:out=min(float(row.Open),pos['stop'])*(1-slip);reason='Stop loss'
+                elif row.High>=pos['target']:out=pos['target']*(1-slip);reason='Profit target'
+            else:
+                if row.High>=pos['stop']:out=max(float(row.Open),pos['stop'])*(1+slip);reason='Stop loss'
+                elif row.Low<=pos['target']:out=pos['target']*(1+slip);reason='Profit target'
+            if out is None and i-pos['index']>=hold:out=float(row.Close)*(1-slip if direction=='LONG' else 1+slip);reason='Maximum holding time'
+            if out is not None:
+                pnl=pos['qty']*((out-pos['entry']) if direction=='LONG' else (pos['entry']-out))-commission; cash+=pnl; trades.append({'Direction':direction,'Entry date':pos['day'],'Exit date':day,'Entry':pos['entry'],'Exit':out,'Units':pos['qty'],'Profit/Loss':pnl,'Exit reason':reason});pos=None
+        if pos is None and i>0 and bool(signals.iloc[i-1]):
+            prev=d.iloc[i-1]; entry=float(row.Open)*(1+slip if direction=='LONG' else 1-slip); atr=float(prev.atr); look=int(p.get('swing_lookback',5)); rr=float(p.get('reward_risk',2)); mult=float(p.get('atr_stop_mult',1.5))
+            if direction=='LONG': stop=min(float(prev.low_swing),entry-mult*atr); target=entry+rr*(entry-stop); riskunit=entry-stop
+            else: stop=max(float(prev.high_swing),entry+mult*atr); target=entry-rr*(stop-entry); riskunit=stop-entry
+            if np.isfinite(riskunit) and riskunit>0:
+                qty=max(0,(cash*risk_pct/100-commission)/riskunit); pos={'index':i,'day':day,'entry':entry,'stop':stop,'target':target,'qty':qty}; cash-=commission
+        mark=0 if not pos else pos['qty']*((float(row.Close)-pos['entry']) if direction=='LONG' else (pos['entry']-float(row.Close))); equity.append({'day':day,'equity':cash+mark})
+    eq=pd.DataFrame(equity); t=pd.DataFrame(trades)
+    if eq.empty:return {},eq,t
+    peak=eq.equity.cummax(); dd=(eq.equity/peak-1).min()*100; years=max((pd.Timestamp(eq.day.iloc[-1])-pd.Timestamp(eq.day.iloc[0])).days/365.25,1/365.25); cagr=((eq.equity.iloc[-1]/initial)**(1/years)-1)*100; pnl=t['Profit/Loss'] if not t.empty else pd.Series(dtype=float); gains=pnl[pnl>0].sum(); losses=-pnl[pnl<0].sum(); daily=eq.equity.pct_change().dropna(); sharpe=np.sqrt(252)*daily.mean()/daily.std() if len(daily)>2 and daily.std()>0 else 0
+    return {'Total return %':round((eq.equity.iloc[-1]/initial-1)*100,2),'Annualised return %':round(cagr,2),'Worst drawdown %':round(dd,2),'Trades':len(t),'Winning trades %':round(100*(pnl>0).mean(),1) if len(pnl) else 0,'Profit factor':round(gains/losses,2) if losses else None,'Risk-adjusted score':round(float(sharpe),2)},eq,t
+
+def optimise_v3(d,strategy,param_grid,risk_pct=.5,commission=1.5,slippage_pct=.05,limit=200):
+    base=get_strategy(strategy)['config']; keys=list(param_grid); rows=[]
+    for vals in list(itertools.product(*[param_grid[k] for k in keys]))[:limit]:
+        cfg=copy.deepcopy(base)
+        for k,v in zip(keys,vals):cfg['params'][k]=v
+        try:
+            stats,_,_=backtest_v3(d,cfg,risk_pct=risk_pct,commission=commission,slippage_pct=slippage_pct); row={k:v for k,v in zip(keys,vals)};row.update(stats);rows.append(row)
+        except Exception:pass
+    return pd.DataFrame(rows).sort_values(['Risk-adjusted score','Annualised return %'],ascending=False) if rows else pd.DataFrame()
