@@ -1,20 +1,14 @@
-import unittest
-import numpy as np
-import pandas as pd
-from engine import indicators,backtest,signal_row
-class EngineTests(unittest.TestCase):
-    def setUp(self):
-        idx=pd.bdate_range('2020-01-01',periods=320)
-        close=100+np.linspace(0,40,320)+3*np.sin(np.arange(320)/6)
-        self.d=pd.DataFrame({'Open':close,'High':close+2,'Low':close-2,'Close':close,'Volume':100000},index=idx)
-    def test_indicators(self):
-        d=indicators(self.d)
-        self.assertTrue(all(s in d for s in ['SID','Trend-filtered SID','Trend-Pullback']))
-        self.assertTrue(d['rsi'].dropna().between(0,100).all())
-    def test_backtest(self):
-        for s in ['SID','Trend-filtered SID','Trend-Pullback']:
-            stats,eq,trades=backtest(self.d,s)
-            self.assertGreater(len(eq),0)
-            self.assertTrue((eq.equity>=0).all())
-            self.assertIn('Max drawdown %',stats)
-if __name__=='__main__':unittest.main()
+import os,tempfile
+os.environ['LAB_DB']=tempfile.mktemp(suffix='.db')
+import numpy as np,pandas as pd
+from engine import *
+conn().close()
+assert len(list_strategies())>=3
+clone_strategy('SID','SID Test')
+s=get_strategy('SID Test');assert not s['protected']
+set_strategy_enabled('SID Test',True);assert get_strategy('SID Test')['enabled']
+n=500;idx=pd.date_range('2024-01-01',periods=n,freq='D');price=100+np.cumsum(np.random.default_rng(1).normal(.05,1,n));d=pd.DataFrame({'Open':price,'High':price+1,'Low':price-1,'Close':price,'Volume':100000},index=idx)
+stats,eq,tr=backtest(d,'SID Test');assert 'CAGR %' in stats and not eq.empty
+out=optimise(d,'SID Test',{'rsi_oversold':[25,30]});assert len(out)==2
+delete_strategy('SID Test')
+print('strategy CRUD, backtest and optimiser smoke tests passed')

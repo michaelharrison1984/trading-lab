@@ -50,3 +50,19 @@ Then paste the contents of `portainer-stack.yml` into **Stacks → Add stack →
 - `docker compose logs -f trading-lab` shows UI errors.
 - Back up the Docker volume `lab_data` regularly.
 - Restart after changing environment variables: `docker compose up -d --force-recreate`.
+
+## v2 Strategy Lab upgrade
+The dashboard now includes **Strategy Manager** and **Optimiser** pages.
+
+- SID, Trend-filtered SID and Trend-Pullback are protected built-in templates.
+- Enable/disable any strategy for the scheduled scanner.
+- Edit parameters and entry rules, then save them as a new custom strategy.
+- Custom strategies can be overwritten or deleted from the UI.
+- Backtesting can compare multiple saved strategies on the same ticker/history.
+- The optimiser grid-searches up to 200 parameter combinations and ranks results by Sharpe then CAGR.
+- Saved custom strategies live in the existing `/data/lab.db` volume, so they survive container recreation.
+
+### Updating an existing installation
+Keep the existing `lab_data` Docker volume so your settings, alerts and paper trades are retained. Replace the application files/image with v2 and recreate both `trading-lab` and `scanner`. On first start, the database schema is upgraded automatically.
+
+The rule builder currently supports price/OHLCV, RSI, MACD histogram, moving averages, ATR, previous high, 20-day average volume and SID-armed state. All configured entry rules use AND logic. This is intentionally constrained rather than allowing arbitrary Python expressions.
