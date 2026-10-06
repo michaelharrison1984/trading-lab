@@ -20,15 +20,34 @@ def conn():
     try:c.execute("ALTER TABLE trades ADD COLUMN direction TEXT DEFAULT 'LONG'")
     except sqlite3.OperationalError:pass
     c.execute('CREATE TABLE IF NOT EXISTS strategies (name TEXT PRIMARY KEY, description TEXT, config TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, protected INTEGER NOT NULL DEFAULT 0, created_at TEXT, updated_at TEXT)')
-    for name,cfg in TEMPLATES.items():
-        c.execute('INSERT OR IGNORE INTO strategies(name,description,config,enabled,protected,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(name,cfg['description'],json.dumps(cfg),1,1,dt.datetime.utcnow().isoformat(),dt.datetime.utcnow().isoformat()))
+    seeded=c.execute("SELECT value FROM settings WHERE key='templates_seeded'").fetchone()
+    if not seeded:
+        for name,cfg in TEMPLATES.items():
+            c.execute('INSERT OR IGNORE INTO strategies(name,description,config,enabled,protected,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(name,cfg['description'],json.dumps(cfg),1,0,dt.datetime.utcnow().isoformat(),dt.datetime.utcnow().isoformat()))
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('templates_seeded','1')")
+    c.execute('UPDATE strategies SET protected=0')
     c.commit(); return c
 def get_setting(k,default=''):
     with conn() as c:r=c.execute('SELECT value FROM settings WHERE key=?',(k,)).fetchone()
     return r[0] if r else default
 def set_setting(k,v):
     with conn() as c:c.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(k,str(v)))
-def symbols():return list(dict.fromkeys(s.strip().upper() for s in get_setting('symbols',DEFAULT).split(',') if s.strip()))
+def symbols():
+    raw=get_setting('symbols',DEFAULT).replace('\n',',').replace(';',',')
+    return list(dict.fromkeys(s.strip().upper() for s in raw.split(',') if s.strip()))
+
+def ticker_search(query):
+    query=query.strip()
+    if not query:return []
+    try:
+        srch=yf.Search(query,max_results=12,news_count=0)
+        rows=[]
+        for q in getattr(srch,'quotes',[]) or []:
+            sym=q.get('symbol'); name=q.get('shortname') or q.get('longname') or q.get('name') or ''
+            exch=q.get('exchange') or q.get('exchDisp') or ''; typ=q.get('quoteType') or q.get('typeDisp') or ''
+            if sym: rows.append({'Ticker':sym,'Name':name,'Exchange':exch,'Type':typ})
+        return rows
+    except Exception:return []
 def list_strategies(enabled_only=False):
     q='SELECT name,description,config,enabled,protected,created_at,updated_at FROM strategies'+(' WHERE enabled=1' if enabled_only else '')+' ORDER BY protected DESC,name'
     with conn() as c: rows=c.execute(q).fetchall()
@@ -51,9 +70,6 @@ def clone_strategy(source,new_name):
     s=get_strategy(source); save_strategy(new_name,'Clone of '+source,copy.deepcopy(s['config']),False,False)
 def delete_strategy(name):
     with conn() as c:
-        r=c.execute('SELECT protected FROM strategies WHERE name=?',(name,)).fetchone()
-        if not r:return
-        if r[0]:raise ValueError('Built-in templates cannot be deleted')
         c.execute('DELETE FROM strategies WHERE name=?',(name,))
 def set_strategy_enabled(name,enabled):
     with conn() as c:c.execute('UPDATE strategies SET enabled=?,updated_at=? WHERE name=?',(int(enabled),dt.datetime.utcnow().isoformat(),name))

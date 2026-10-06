@@ -51,10 +51,11 @@ with tabs[2]:
     if st.button('Save as my strategy',type='primary'):
         try:save_strategy(newname,desc,cfg,enable,False);st.success(f'{newname} saved.');st.rerun()
         except Exception as e:st.error(str(e))
-    if not s['protected']:
+    if True:
         a,b=st.columns(2)
         if a.button('Update this strategy'):save_strategy(selected,desc,cfg,s['enabled'],True);st.success('Updated')
-        if b.button('Delete this strategy'):delete_strategy(selected);st.rerun()
+        confirm=b.checkbox('I understand this permanently removes the strategy from future scans and tests',key='delconfirm')
+        if b.button('Delete this strategy',disabled=not confirm):delete_strategy(selected);st.rerun()
 with tabs[3]:
     st.subheader('Strategy Tuner'); st.write('**What this does:** you choose one or two settings and a few values to try. The Lab runs the same historical test for every combination and shows which versions performed best.')
     st.example=''; st.caption('Example: try RSI oversold at 25, 30, 35 and 40, combined with profit targets of 1.5×, 2× and 2.5× risk. That is 12 tests automatically.')
@@ -80,9 +81,19 @@ with tabs[4]:
     else:st.info('No live paper trades yet. Open one below and it will appear here with a LIVE indicator and changing profit/loss.')
     with st.expander('Open a new simulated trade',expanded=opened.empty):
         with st.form('entry'):
-            a,b,c=st.columns(3);sy=a.text_input('Ticker','AAPL').upper();strat=b.selectbox('Strategy',[s['name'] for s in list_strategies()]);direct=c.radio('Trade',['Buy / Long','Sell / Short']); a,b,c,d=st.columns(4);entry=a.number_input('Entry price',.01,value=100.);stop=b.number_input('Stop loss',.01,value=95. if direct.startswith('Buy') else 105.);target=c.number_input('Profit target',.01,value=110. if direct.startswith('Buy') else 90.);prisk=d.number_input('Account risk (%)',.1,3.,.5)
+            a,b,c=st.columns(3);sy=a.text_input('Ticker','AAPL').upper();strat=b.selectbox('Strategy',[x['name'] for x in list_strategies()]);direct=c.radio('Trade',['Buy / Long','Sell / Short'])
+            use_live=st.checkbox('Use latest available market price as my simulated entry',True,help='Recommended. This prevents a paper trade starting with an artificial profit or loss caused by a made-up entry price.')
+            a,b,c,d=st.columns(4);manual=a.number_input('Manual entry price (only used if option above is unticked)',.01,value=100.);stop=b.number_input('Stop loss',.01,value=95. if direct.startswith('Buy') else 105.);target=c.number_input('Profit target',.01,value=110. if direct.startswith('Buy') else 90.);prisk=d.number_input('Account risk (%)',.1,3.,.5)
             if st.form_submit_button('Open paper trade'):
-                try:qty=paper_open_v3(sy,strat,entry,stop,target,'LONG' if direct.startswith('Buy') else 'SHORT',risk=prisk);st.success(f'Paper trade opened: {qty:.3f} units');st.rerun()
+                try:
+                    if use_live:
+                        qq=live_quotes([sy]).get(sy,{})
+                        if 'price' not in qq: raise ValueError('Could not obtain a current market price for '+sy)
+                        entry=float(qq['price'])
+                    else: entry=float(manual)
+                    if direct.startswith('Buy') and not (stop<entry<target): raise ValueError(f'For a Buy trade, set Stop < Entry ({entry:.2f}) < Target.')
+                    if direct.startswith('Sell') and not (target<entry<stop): raise ValueError(f'For a Short trade, set Target < Entry ({entry:.2f}) < Stop.')
+                    qty=paper_open_v3(sy,strat,entry,stop,target,'LONG' if direct.startswith('Buy') else 'SHORT',risk=prisk);st.success(f'Paper trade opened at {cur_symbol}{entry:.2f}: {qty:.3f} units');st.rerun()
                 except Exception as e:st.error(str(e))
     if not opened.empty:
         with st.expander('Close a paper trade'):
@@ -90,8 +101,20 @@ with tabs[4]:
             if st.button('Close selected trade'):paper_close(int(tid),price);st.rerun()
     if not closed.empty:st.markdown('#### Completed paper trades');st.dataframe(closed,use_container_width=True,hide_index=True)
 with tabs[5]:
-    st.subheader('Settings'); cur=st.selectbox('Default currency',['GBP','USD','EUR'],index=['GBP','USD','EUR'].index(get_setting('currency','GBP'))); watch=st.text_area('Shares / ETFs to scan (Yahoo tickers, .L for London)',get_setting('symbols',DEFAULT),height=120)
-    if st.button('Save settings'):set_setting('currency',cur);set_setting('symbols',watch);st.success('Settings saved — refresh once if the currency symbol has changed.')
+    st.subheader('Settings'); cur=st.selectbox('Default currency',['GBP','USD','EUR'],index=['GBP','USD','EUR'].index(get_setting('currency','GBP')))
+    st.markdown('#### Find a ticker')
+    st.caption('Search by company or fund name, e.g. Apple, Tesco, VWRP or Shell. London-listed Yahoo tickers usually end in .L.')
+    tq=st.text_input('Company / ETF search')
+    if tq:
+        found=ticker_search(tq)
+        if found: st.dataframe(pd.DataFrame(found),use_container_width=True,hide_index=True)
+        else: st.info('No ticker matches found. Try a shorter company or fund name.')
+    st.markdown('#### Daily scan watchlist')
+    st.caption('Enter one ticker per line. Commas also work. Examples: AAPL for Apple (US), SHEL.L for Shell (London), VWRP.L for Vanguard FTSE All-World ETF (London).')
+    current='\n'.join(symbols())
+    watch=st.text_area('Tickers to scan',current,height=220,placeholder='AAPL\nMSFT\nSHEL.L\nVWRP.L')
+    st.caption(f'{len([x for x in watch.replace(chr(10), chr(44)).split(chr(44)) if x.strip()])} ticker(s) currently entered.')
+    if st.button('Save settings'):set_setting('currency',cur);set_setting('symbols',','.join(x.strip().upper() for x in watch.replace('\n',',').split(',') if x.strip()));st.success('Settings saved.')
     if st.button('Send Telegram test'):
         ok,msg=send_telegram('Trading Strategy Lab: Telegram test successful.');(st.success if ok else st.error)(msg)
     st.caption('Automatic scanning remains Monday–Friday at the configured time. Hourly strategies can be backtested, while scheduled scanning remains daily in this version.')
