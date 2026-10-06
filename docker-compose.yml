@@ -1,0 +1,31 @@
+services:
+  trading-lab:
+    build: .
+    ports:
+      - "8509:8501"
+    environment:
+      TZ: Europe/London
+      LAB_DB: /data/lab.db
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      SCAN_HOUR_UTC: "22"
+      SCAN_MINUTE_UTC: "30"
+    volumes:
+      - lab_data:/data
+    restart: unless-stopped
+  scanner:
+    build: .
+    command: ["python", "worker.py"]
+    environment:
+      TZ: Europe/London
+      LAB_DB: /data/lab.db
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      SCAN_HOUR_UTC: "22"
+      SCAN_MINUTE_UTC: "30"
+    volumes:
+      - lab_data:/data
+    restart: unless-stopped
+
+volumes:
+  lab_data:
