@@ -233,3 +233,155 @@ def optimise_v3(d,strategy,param_grid,risk_pct=.5,commission=1.5,slippage_pct=.0
             stats,_,_=backtest_v3(d,cfg,risk_pct=risk_pct,commission=commission,slippage_pct=slippage_pct); row={k:v for k,v in zip(keys,vals)};row.update(stats);rows.append(row)
         except Exception:pass
     return pd.DataFrame(rows).sort_values(['Risk-adjusted score','Annualised return %'],ascending=False) if rows else pd.DataFrame()
+
+# ---- v5 Strategy Library / guided strategy engine ----
+V5_LIBRARY = {
+ 'SID': {'description':'Buy after RSI has been oversold and momentum starts recovering.','category':'Mean Reversion','direction':'LONG','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':30,'rsi_high':70,'rsi_exit_long':50,'rsi_exit_short':50,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.5,'swing_lookback':5,'reward_risk':2.0,'max_hold':20},'recipe':'RSI_REVERSAL','use_trend':False,'use_macd':True},
+ 'Trend SID': {'description':'SID-style RSI recovery, but only in the direction of the wider trend.','category':'Mean Reversion','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':30,'rsi_high':70,'rsi_exit_long':50,'rsi_exit_short':50,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.5,'swing_lookback':5,'reward_risk':2.0,'max_hold':20},'recipe':'RSI_REVERSAL','use_trend':True,'use_macd':True},
+ 'RSI Reversal': {'description':'Buy oversold recoveries and/or short overbought reversals.','category':'Mean Reversion','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':30,'rsi_high':70,'rsi_exit_long':55,'rsi_exit_short':45,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.5,'swing_lookback':5,'reward_risk':2.0,'max_hold':15},'recipe':'RSI_REVERSAL','use_trend':False,'use_macd':False},
+ 'Moving Average Trend': {'description':'Follow established trends when the faster moving average is on the correct side of the slower average.','category':'Trend','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':40,'rsi_high':60,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':2.0,'swing_lookback':10,'reward_risk':2.5,'max_hold':40},'recipe':'MA_TREND','use_trend':True,'use_macd':False},
+ 'MACD Momentum': {'description':'Enter when MACD momentum crosses in the direction of the trade, optionally with a trend filter.','category':'Momentum','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':35,'rsi_high':65,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.8,'swing_lookback':7,'reward_risk':2.0,'max_hold':25},'recipe':'MACD_MOMENTUM','use_trend':True,'use_macd':True},
+ 'Trend Pullback': {'description':'Join an existing trend after RSI pulls back and then turns back with the trend.','category':'Trend','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':40,'rsi_high':60,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.5,'swing_lookback':5,'reward_risk':2.0,'max_hold':20},'recipe':'TREND_PULLBACK','use_trend':True,'use_macd':True},
+ '20-Day Breakout': {'description':'Buy new 20-bar highs or short new 20-bar lows in the direction of the broader trend.','category':'Breakout','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':40,'rsi_high':60,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'breakout_lookback':20,'atr_period':14,'atr_stop_mult':2.0,'swing_lookback':10,'reward_risk':2.5,'max_hold':30},'recipe':'BREAKOUT','use_trend':True,'use_macd':False},
+ '50-Day Breakout': {'description':'A slower breakout strategy looking for significant new highs or lows.','category':'Breakout','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':40,'rsi_high':60,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'breakout_lookback':50,'atr_period':14,'atr_stop_mult':2.2,'swing_lookback':10,'reward_risk':3.0,'max_hold':50},'recipe':'BREAKOUT','use_trend':True,'use_macd':False},
+ 'RSI + MACD Confirmation': {'description':'RSI reversal setup confirmed by MACD momentum turning in the same direction.','category':'Momentum','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':35,'rsi_high':65,'rsi_exit_long':55,'rsi_exit_short':45,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.5,'swing_lookback':5,'reward_risk':2.0,'max_hold':20},'recipe':'RSI_REVERSAL','use_trend':False,'use_macd':True},
+ 'Counter-Trend Extreme': {'description':'Fade unusually stretched RSI readings with tighter holding periods. Higher risk: use cautiously.','category':'Mean Reversion','direction':'BOTH','timeframe':'Daily','params':{'rsi_period':14,'rsi_low':25,'rsi_high':75,'rsi_exit_long':50,'rsi_exit_short':50,'macd_fast':12,'macd_slow':26,'macd_signal':9,'ma_fast':50,'ma_slow':200,'atr_period':14,'atr_stop_mult':1.3,'swing_lookback':5,'reward_risk':1.5,'max_hold':10},'recipe':'RSI_REVERSAL','use_trend':False,'use_macd':False},
+}
+
+def seed_v5_library():
+    with conn() as c:
+        done=c.execute("SELECT value FROM settings WHERE key='v5_library_seeded'").fetchone()
+        if done:return
+        now=dt.datetime.utcnow().isoformat()
+        for name,cfg in V5_LIBRARY.items():
+            c.execute('INSERT OR IGNORE INTO strategies(name,description,config,enabled,protected,created_at,updated_at) VALUES(?,?,?,?,0,?,?)',(name,cfg['description'],json.dumps(cfg),0,now,now))
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('v5_library_seeded','1')")
+
+def v5_indicators(d,cfg):
+    d=indicators(d,{'params':cfg['params'],'rules':{'all':[{'field':'close','op':'>','value':-1}]}})
+    p=cfg['params']; look=int(p.get('breakout_lookback',20))
+    d['high_swing']=d.High.shift(1).rolling(int(p.get('swing_lookback',5))).max()
+    d['breakout_high']=d.High.shift(1).rolling(look).max(); d['breakout_low']=d.Low.shift(1).rolling(look).min()
+    d['hist_cross_up']=(d['hist']>0)&(d['hist_prev']<=0); d['hist_cross_down']=(d['hist']<0)&(d['hist_prev']>=0)
+    return d
+
+def v5_signal_sides(d,cfg):
+    p=cfg['params']; recipe=cfg.get('recipe','RSI_REVERSAL'); trend=bool(cfg.get('use_trend',False)); macd=bool(cfg.get('use_macd',False)); direction=cfg.get('direction','LONG').upper()
+    long=pd.Series(False,index=d.index); short=pd.Series(False,index=d.index)
+    trend_long=(d.Close>d.ma_fast)&(d.ma_fast>d.ma_slow); trend_short=(d.Close<d.ma_fast)&(d.ma_fast<d.ma_slow)
+    if recipe=='RSI_REVERSAL':
+        long=(d.rsi_prev<=float(p.get('rsi_low',30)))&(d.rsi>d.rsi_prev)
+        short=(d.rsi_prev>=float(p.get('rsi_high',70)))&(d.rsi<d.rsi_prev)
+        if macd: long&=d['hist']>d.hist_prev; short&=d['hist']<d.hist_prev
+    elif recipe=='TREND_PULLBACK':
+        long=(d.rsi_prev<=float(p.get('rsi_low',40)))&(d.rsi>d.rsi_prev)&(d.Close>d.high_prev)
+        short=(d.rsi_prev>=float(p.get('rsi_high',60)))&(d.rsi<d.rsi_prev)&(d.Close<d.Low.shift(1))
+        if macd: long&=d['hist']>d.hist_prev; short&=d['hist']<d.hist_prev
+    elif recipe=='MA_TREND':
+        long=trend_long & ~(trend_long.shift(1).fillna(False)); short=trend_short & ~(trend_short.shift(1).fillna(False))
+    elif recipe=='MACD_MOMENTUM':
+        long=d.hist_cross_up; short=d.hist_cross_down
+    elif recipe=='BREAKOUT':
+        long=d.Close>d.breakout_high; short=d.Close<d.breakout_low
+    if trend: long&=trend_long; short&=trend_short
+    if direction=='LONG':short[:]=False
+    elif direction=='SHORT':long[:]=False
+    return long.fillna(False),short.fillna(False)
+
+def strategy_plain_english(cfg):
+    p=cfg['params']; direction=cfg.get('direction','LONG'); recipe=cfg.get('recipe','RSI_REVERSAL'); lines=[]
+    if direction in ('LONG','BOTH'):
+        if recipe=='RSI_REVERSAL': lines.append(f"BUY when RSI({int(p.get('rsi_period',14))}) was at/below {p.get('rsi_low',30)} and turns upward" + (' with improving MACD' if cfg.get('use_macd') else ''))
+        elif recipe=='TREND_PULLBACK': lines.append(f"BUY an uptrend after RSI pulls back to about {p.get('rsi_low',40)} and price turns upward")
+        elif recipe=='MA_TREND': lines.append(f"BUY when the {int(p.get('ma_fast',50))}-bar average moves into an uptrend above the {int(p.get('ma_slow',200))}-bar average")
+        elif recipe=='MACD_MOMENTUM': lines.append('BUY when MACD momentum crosses upward')
+        elif recipe=='BREAKOUT': lines.append(f"BUY when price closes above the previous {int(p.get('breakout_lookback',20))}-bar high")
+    if direction in ('SHORT','BOTH'):
+        if recipe=='RSI_REVERSAL': lines.append(f"SHORT when RSI({int(p.get('rsi_period',14))}) was at/above {p.get('rsi_high',70)} and turns downward" + (' with weakening MACD' if cfg.get('use_macd') else ''))
+        elif recipe=='TREND_PULLBACK': lines.append(f"SHORT a downtrend after RSI rallies to about {p.get('rsi_high',60)} and price turns downward")
+        elif recipe=='MA_TREND': lines.append(f"SHORT when the {int(p.get('ma_fast',50))}-bar average moves into a downtrend below the {int(p.get('ma_slow',200))}-bar average")
+        elif recipe=='MACD_MOMENTUM': lines.append('SHORT when MACD momentum crosses downward')
+        elif recipe=='BREAKOUT': lines.append(f"SHORT when price closes below the previous {int(p.get('breakout_lookback',20))}-bar low")
+    if cfg.get('use_trend') and recipe!='MA_TREND': lines.append(f"Only trade with the wider {int(p.get('ma_fast',50))}/{int(p.get('ma_slow',200))}-bar trend")
+    lines.append(f"Stop about {p.get('atr_stop_mult',1.5)}× recent volatility beyond the setup; target {p.get('reward_risk',2)}× the amount risked")
+    lines.append(f"Give up after {int(p.get('max_hold',20))} bars if neither stop nor target is reached")
+    return lines
+
+def backtest_v5(d,strategy,initial=10000,risk_pct=.5,commission=1.5,slippage_pct=.05,max_hold=None):
+    s=get_strategy(strategy) if isinstance(strategy,str) else {'name':'Ad hoc','config':strategy}; cfg=s['config']; d=v5_indicators(d,cfg); longs,shorts=v5_signal_sides(d,cfg); cash=float(initial); equity=[]; trades=[]; pos=None; p=cfg['params']; hold=int(max_hold or p.get('max_hold',20)); warmup=max(60,int(p.get('ma_slow',50))+5,int(p.get('breakout_lookback',20))+5); slip=slippage_pct/100
+    for i in range(warmup,len(d)):
+        day=str(d.index[i].date()); row=d.iloc[i]
+        if pos:
+            side=pos['side']; out=None; reason=''
+            if side=='LONG':
+                if row.Low<=pos['stop']:out=min(float(row.Open),pos['stop'])*(1-slip);reason='Stop loss'
+                elif row.High>=pos['target']:out=pos['target']*(1-slip);reason='Profit target'
+                elif p.get('rsi_exit_long') is not None and row.rsi>=float(p['rsi_exit_long']):out=float(row.Close)*(1-slip);reason='RSI recovery exit'
+            else:
+                if row.High>=pos['stop']:out=max(float(row.Open),pos['stop'])*(1+slip);reason='Stop loss'
+                elif row.Low<=pos['target']:out=pos['target']*(1+slip);reason='Profit target'
+                elif p.get('rsi_exit_short') is not None and row.rsi<=float(p['rsi_exit_short']):out=float(row.Close)*(1+slip);reason='RSI reversal exit'
+            if out is None and i-pos['index']>=hold:out=float(row.Close)*(1-slip if side=='LONG' else 1+slip);reason='Maximum holding time'
+            if out is not None:
+                pnl=pos['qty']*((out-pos['entry']) if side=='LONG' else (pos['entry']-out))-commission; cash+=pnl; trades.append({'Direction':side,'Entry date':pos['day'],'Exit date':day,'Entry':pos['entry'],'Exit':out,'Units':pos['qty'],'Profit/Loss':pnl,'Exit reason':reason});pos=None
+        if pos is None and i>0:
+            side='LONG' if bool(longs.iloc[i-1]) else ('SHORT' if bool(shorts.iloc[i-1]) else None)
+            if side:
+                prev=d.iloc[i-1]; entry=float(row.Open)*(1+slip if side=='LONG' else 1-slip); atr=float(prev.atr); rr=float(p.get('reward_risk',2)); mult=float(p.get('atr_stop_mult',1.5))
+                if side=='LONG': stop=min(float(prev.low_swing),entry-mult*atr); riskunit=entry-stop; target=entry+rr*riskunit
+                else: stop=max(float(prev.high_swing),entry+mult*atr); riskunit=stop-entry; target=entry-rr*riskunit
+                if np.isfinite(riskunit) and riskunit>0:
+                    qty=max(0,(cash*risk_pct/100-commission)/riskunit); pos={'index':i,'day':day,'entry':entry,'stop':stop,'target':target,'qty':qty,'side':side}; cash-=commission
+        mark=0 if not pos else pos['qty']*((float(row.Close)-pos['entry']) if pos['side']=='LONG' else (pos['entry']-float(row.Close))); equity.append({'day':day,'equity':cash+mark})
+    eq=pd.DataFrame(equity); t=pd.DataFrame(trades)
+    if eq.empty:return {},eq,t
+    peak=eq.equity.cummax(); dd=(eq.equity/peak-1).min()*100; years=max((pd.Timestamp(eq.day.iloc[-1])-pd.Timestamp(eq.day.iloc[0])).days/365.25,1/365.25); cagr=((eq.equity.iloc[-1]/initial)**(1/years)-1)*100; pnl=t['Profit/Loss'] if not t.empty else pd.Series(dtype=float); gains=pnl[pnl>0].sum(); losses=-pnl[pnl<0].sum(); daily=eq.equity.pct_change().dropna(); sharpe=np.sqrt(252)*daily.mean()/daily.std() if len(daily)>2 and daily.std()>0 else 0
+    return {'Total return %':round((eq.equity.iloc[-1]/initial-1)*100,2),'Annualised return %':round(cagr,2),'Worst drawdown %':round(dd,2),'Trades':len(t),'Winning trades %':round(100*(pnl>0).mean(),1) if len(pnl) else 0,'Profit factor':round(gains/losses,2) if losses else None,'Risk-adjusted score':round(float(sharpe),2)},eq,t
+
+def optimise_v5(d,strategy,param_grid,risk_pct=.5,commission=1.5,slippage_pct=.05,limit=300):
+    base=get_strategy(strategy)['config']; keys=list(param_grid); rows=[]
+    for vals in list(itertools.product(*[param_grid[k] for k in keys]))[:limit]:
+        cfg=copy.deepcopy(base)
+        for k,v in zip(keys,vals):cfg['params'][k]=v
+        try:
+            stats,_,_=backtest_v5(d,cfg,risk_pct=risk_pct,commission=commission,slippage_pct=slippage_pct); row={k:v for k,v in zip(keys,vals)}; row.update(stats); rows.append(row)
+        except Exception:pass
+    return pd.DataFrame(rows).sort_values(['Risk-adjusted score','Annualised return %'],ascending=False) if rows else pd.DataFrame()
+
+def scan_v5():
+    seed_v5_library(); found=[]; errors=[]
+    for symbol in symbols():
+        try:
+            raw=fetch(symbol,'2y')
+            for s in list_strategies(True):
+                cfg=s['config']; d=v5_indicators(raw,cfg); longs,shorts=v5_signal_sides(d,cfg); i=len(d)-1; side='LONG' if bool(longs.iloc[i]) else ('SHORT' if bool(shorts.iloc[i]) else None)
+                if not side:continue
+                row=d.iloc[i]; p=cfg['params']; atr=float(row.atr); mult=float(p.get('atr_stop_mult',1.5)); rr=float(p.get('reward_risk',2)); price=float(row.Close)
+                if side=='LONG':stop=min(float(row.low_swing),price-mult*atr);target=price+rr*(price-stop)
+                else:stop=max(float(row.high_swing),price+mult*atr);target=price-rr*(stop-price)
+                day=str(d.index[i].date())
+                with conn() as c:
+                    if c.execute('SELECT 1 FROM alerts WHERE symbol=? AND strategy=? AND day=?',(symbol,s['name'],day)).fetchone():continue
+                    c.execute('INSERT INTO alerts VALUES (?,?,?,?,?,?)',(symbol,s['name'],day,price,stop,target))
+                found.append((symbol,s['name'],side,day,price,stop,target,float(row.rsi)))
+        except Exception as e:errors.append(f'{symbol}: {e}')
+    for symbol,strategy,side,day,price,stop,target,rsi in found:send_telegram(f"{'📈 BUY' if side=='LONG' else '📉 SHORT'} Trading Lab signal\n{symbol} — {strategy}\nDate: {day}\nClose: {price:.2f}\nIndicative stop: {stop:.2f}\nTarget: {target:.2f}\nRSI: {rsi:.1f}\nReview before trading; not an executed order.")
+    return found,errors
+
+def import_strategy_recipe(text,name='Imported Strategy'):
+    """Safe best-effort importer: recognises common strategy descriptions/Pine snippets; never executes supplied code."""
+    low=text.lower(); base=copy.deepcopy(V5_LIBRARY['RSI Reversal'])
+    if 'breakout' in low or 'highest(' in low or 'lowest(' in low: base=copy.deepcopy(V5_LIBRARY['20-Day Breakout'])
+    elif 'macd' in low and 'rsi' not in low: base=copy.deepcopy(V5_LIBRARY['MACD Momentum'])
+    elif 'crossover' in low and ('sma' in low or 'ema' in low): base=copy.deepcopy(V5_LIBRARY['Moving Average Trend'])
+    elif 'pullback' in low: base=copy.deepcopy(V5_LIBRARY['Trend Pullback'])
+    import re
+    nums=[int(x) for x in re.findall(r'\brsi[^\n]{0,30}?([0-9]{2})\b',low)]
+    if nums:
+        for n in nums:
+            if n<=45:base['params']['rsi_low']=n
+            if n>=55:base['params']['rsi_high']=n
+    if 'short' in low and not any(x in low for x in ['long and short','long/short','both']):base['direction']='SHORT'
+    elif 'long' in low and 'short' not in low:base['direction']='LONG'
+    base['description']='Imported/translated strategy recipe. Review the interpretation before saving.'
+    return base

@@ -1,13 +1,9 @@
-import os,logging,time
-from apscheduler.schedulers.blocking import BlockingScheduler
-from engine import scan
-logging.basicConfig(level=logging.INFO)
+import time, schedule
+from engine import scan_v5, get_setting, seed_v5_library
+seed_v5_library()
 def job():
-    try:
-        found,errors=scan();logging.info('Scan: %s signals; errors: %s',len(found),errors)
-    except Exception:logging.exception('Scan failed')
-if __name__=='__main__':
-    s=BlockingScheduler(timezone='UTC')
-    s.add_job(job,'cron',day_of_week='mon-fri',hour=int(os.getenv('SCAN_HOUR_UTC','22')),minute=int(os.getenv('SCAN_MINUTE_UTC','30')),id='daily',max_instances=1,coalesce=True)
-    logging.info('Worker running; daily scans Mon-Fri at %s:%s UTC',os.getenv('SCAN_HOUR_UTC','22'),os.getenv('SCAN_MINUTE_UTC','30'))
-    s.start()
+    print('Starting daily scan...',flush=True)
+    found,errors=scan_v5(); print(f'Scan complete: {len(found)} signals, {len(errors)} errors',flush=True)
+schedule.every().monday.at('22:30').do(job);schedule.every().tuesday.at('22:30').do(job);schedule.every().wednesday.at('22:30').do(job);schedule.every().thursday.at('22:30').do(job);schedule.every().friday.at('22:30').do(job)
+print('Trading Strategy Lab v5 scanner running',flush=True)
+while True:schedule.run_pending();time.sleep(30)
