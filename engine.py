@@ -74,12 +74,31 @@ def delete_strategy(name):
 def set_strategy_enabled(name,enabled):
     with conn() as c:c.execute('UPDATE strategies SET enabled=?,updated_at=? WHERE name=?',(int(enabled),dt.datetime.utcnow().isoformat(),name))
 def validate_config(cfg):
-    if not isinstance(cfg,dict) or 'params' not in cfg or 'rules' not in cfg:raise ValueError('Config needs params and rules')
-    rules=cfg['rules'].get('all',[])
-    if not rules:raise ValueError('At least one entry rule is required')
+    """Accept both the legacy rules engine and the v5 guided recipe format."""
+    if not isinstance(cfg, dict) or not isinstance(cfg.get('params'), dict):
+        raise ValueError('Strategy settings are missing. Please select a library template again.')
+    if 'recipe' in cfg:
+        if cfg['recipe'] not in ('RSI_REVERSAL', 'TREND_PULLBACK', 'MA_TREND', 'MACD_MOMENTUM', 'BREAKOUT'):
+            raise ValueError('Unsupported strategy type')
+        if cfg.get('direction', 'LONG').upper() not in ('LONG', 'SHORT', 'BOTH'):
+            raise ValueError('Choose Buy, Short, or Both')
+        if cfg.get('timeframe', 'Daily') not in ('Daily', 'Hourly'):
+            raise ValueError('Choose Daily or Hourly timeframe')
+        p = cfg['params']
+        for key in ('rsi_period', 'macd_fast', 'macd_slow', 'macd_signal', 'ma_fast', 'ma_slow', 'atr_period', 'swing_lookback', 'max_hold', 'breakout_lookback'):
+            if key in p and (not isinstance(p[key], (int, float)) or p[key] <= 0):
+                raise ValueError(f'{key} must be positive')
+        if p.get('reward_risk', 2) <= 0 or p.get('atr_stop_mult', 1.5) <= 0:
+            raise ValueError('Profit target and stop distance must be positive')
+        return
+    if not isinstance(cfg.get('rules'), dict):
+        raise ValueError('Legacy strategy rules are missing')
+    rules = cfg['rules'].get('all', [])
+    if not rules: raise ValueError('At least one entry rule is required')
     for r in rules:
-        if r.get('field') not in FIELDS or r.get('op') not in OPS:raise ValueError('Invalid rule field/operator')
-        if not any(k in r for k in ('value','param','compare')):raise ValueError('Each rule needs value, param or compare')
+        if r.get('field') not in FIELDS or r.get('op') not in OPS: raise ValueError('Invalid rule field/operator')
+        if not any(k in r for k in ('value', 'param', 'compare')): raise ValueError('Each rule needs value, param or compare')
+
 def fetch(symbol,period='10y',interval='1d'):
     # Yahoo limits intraday history; use a compatible period automatically.
     if interval=='1h' and period in ('5y','10y','max'): period='2y'
